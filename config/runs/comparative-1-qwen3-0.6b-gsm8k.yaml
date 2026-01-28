@@ -23,6 +23,13 @@ training:
 decoding:
   strategy: greedy
   max_new_tokens: 128
+  budget:
+    B: 10
+    k: 6
+    b: 3
+    J: 2
+    rollback_w: 8
+    lookahead: 8
 optuna:
   n_trials: 0
   search_spaces: []
