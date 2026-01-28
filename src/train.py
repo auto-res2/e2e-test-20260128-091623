@@ -241,7 +241,7 @@ def fit_risk_model(
     assert model.linear.out_features == 1, "Risk model output dimension mismatch"
 
     mean = features.mean(dim=0)
-    std = features.std(dim=0)
+    std = features.std(dim=0, unbiased=False)
     std = torch.where(std < 1e-6, torch.ones_like(std), std)
     model.set_normalization(mean.to(device), std.to(device))
 
