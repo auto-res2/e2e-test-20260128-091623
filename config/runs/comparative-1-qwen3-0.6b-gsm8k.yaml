@@ -1,0 +1,25 @@
+run_id: comparative-1-qwen3-0.6b-gsm8k
+method: Greedy Decoding
+model:
+  name: Qwen/Qwen3-0.6B
+  precision: bf16
+dataset:
+  name: gsm8k
+  split:
+    calibration_size: 500
+    test_size: 1000
+    split_seed: 42
+  preprocessing:
+    max_length: 512
+    normalization: extract_last_int
+training:
+  learning_rate: 1e-4
+  batch_size: 1
+  epochs: 1
+  optimizer: adamw
+  weight_decay: 0.0
+  warmup_steps: 0
+  gradient_accumulation_steps: 1
+decoding:
+  strategy: greedy
+  max_new_tokens: 128

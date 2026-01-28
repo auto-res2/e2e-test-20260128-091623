@@ -1,0 +1,17 @@
+defaults:
+  - _self_
+  - runs: ${run}
+
+run: proposed-qwen3-0.6b-gsm8k
+mode: full
+results_dir: results
+
+wandb:
+  entity: airas
+  project: 2026-01-28
+  mode: online
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

@@ -1,0 +1,71 @@
+run_id: proposed-qwen3-0.6b-gsm8k
+method: CR²AD (Conformal Risk-Controlled Rollback Anytime Decoding)
+model:
+  name: Qwen/Qwen3-0.6B
+  precision: bf16
+dataset:
+  name: gsm8k
+  split:
+    calibration_size: 500
+    test_size: 1000
+    split_seed: 42
+  preprocessing:
+    max_length: 512
+    normalization: extract_last_int
+training:
+  learning_rate: 1e-4
+  batch_size: 1
+  epochs: 1
+  optimizer: adamw
+  weight_decay: 0.0
+  warmup_steps: 0
+  gradient_accumulation_steps: 1
+decoding:
+  max_new_tokens: 128
+  alpha: 0.2
+  lambda_logp: 0.02
+  budget:
+    B: 10
+    k: 6
+    b: 3
+    J: 2
+    rollback_w: 8
+    lookahead: 8
+  risk_model:
+    type: logistic_regression
+    T: 24
+    features:
+      - min_margin
+      - mean_margin
+      - mean_entropy
+      - local_min_margin
+      - slope_margin
+      - first_low_margin_pos
+optuna:
+  n_trials: 20
+  search_spaces:
+    - param_name: alpha
+      distribution_type: categorical
+      choices: [0.1, 0.15, 0.2, 0.25]
+    - param_name: B
+      distribution_type: categorical
+      choices: [6, 8, 10, 12]
+    - param_name: rollback_w
+      distribution_type: categorical
+      choices: [4, 8, 12]
+    - param_name: k
+      distribution_type: categorical
+      choices: [4, 6, 8]
+    - param_name: b
+      distribution_type: categorical
+      choices: [2, 3, 4]
+    - param_name: lookahead
+      distribution_type: categorical
+      choices: [4, 8, 12]
+    - param_name: J
+      distribution_type: categorical
+      choices: [1, 2, 3]
+    - param_name: lambda_logp
+      distribution_type: uniform
+      low: 0.0
+      high: 0.05
