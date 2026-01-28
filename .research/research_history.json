@@ -864,5 +864,134 @@
     "experimental_code": "import re, math, random\nimport numpy as np\nimport torch\nfrom transformers import AutoTokenizer, AutoModelForCausalLM\n\ntry:\n    from sklearn.linear_model import LogisticRegression\nexcept Exception:\n    LogisticRegression = None\n\nDEVICE = \"cuda\" if torch.cuda.is_available() else \"cpu\"\n\n# ----------------- Utilities -----------------\n\ndef last_int(text):\n    nums = re.findall(r\"-?\\d+\", text)\n    return int(nums[-1]) if nums else None\n\ndef last_ab(text):\n    m = re.findall(r\"\\b(A|B)\\b\", text)\n    return m[-1] if m else None\n\n# ----------------- Synthetic datasets -----------------\nOPS = [\"+\", \"-\", \"*\"]\n\ndef gen_arith(steps=3, bound=9):\n    x = random.randint(1, bound)\n    expr = str(x)\n    desc = [f\"Start with {x}.\"]\n    for _ in range(steps):\n        op = random.choice(OPS)\n        a = random.randint(1, bound)\n        if op == \"+\":\n            desc.append(f\"Add {a}.\")\n        elif op == \"-\":\n            desc.append(f\"Subtract {a}.\")\n        else:\n            desc.append(f\"Multiply by {a}.\")\n        expr = f\"({expr}{op}{a})\"\n    y = int(eval(expr))\n    q = \" \".join(desc) + \" What is the result?\"\n    return q, y\n\ndef gen_coinflip(n=4):\n    # Start at A. Each flip toggles.\n    flips = [random.choice([\"flip\", \"stay\"]) for _ in range(n)]\n    state = \"A\"\n    desc = [\"A coin starts on side A.\"]\n    for f in flips:\n        if f == \"flip\":\n            state = \"B\" if state == \"A\" else \"A\"\n            desc.append(\"Flip it.\")\n        else:\n            desc.append(\"Do not flip it.\")\n    q = \" \".join(desc) + \" What side is it on now? Answer A or B.\"\n    return q, state\n\ndef make_data(task=\"arith\", n=1000, seed=0):\n    random.seed(seed)\n    data = []\n    for _ in range(n):\n        if task == \"arith\":\n            steps = random.randint(2, 5)\n            data.append(gen_arith(steps=steps))\n        else:\n            steps = random.randint(2, 6)\n            data.append(gen_coinflip(n=steps))\n    return data\n\n# ----------------- Logit-derived uncertainty -----------------\n@torch.no_grad()\ndef next_stats(model, ids):\n    out = model(ids)\n    logits = out.logits[:, -1, :]\n    probs = torch.softmax(logits, dim=-1)\n    top2 = torch.topk(probs, k=2, dim=-1)\n    p1 = top2.values[0, 0].item(); p2 = top2.values[0, 1].item()\n    margin = p1 - p2\n    ent = float(-(probs * (probs + 1e-12).log()).sum().item())\n    return probs, margin, ent\n\n\ndef features_from_trace(margins, ents, T=24, W=8):\n    # prefix features (cheap, model-agnostic)\n    tT = min(T, len(margins))\n    if tT == 0:\n        return np.zeros(6, dtype=np.float32)\n    m = np.array(margins[:tT], dtype=np.float32)\n    e = np.array(ents[:tT], dtype=np.float32)\n    mm = float(m.min())\n    am = float(m.mean())\n    me = float(e.mean())\n    # local late-spike detector\n    w = min(W, tT)\n    local_min = float(m[-w:].min())\n    # slope of margin (early vs late)\n    slope = float(m[-1] - m[0])\n    first_low = float(next((i for i, x in enumerate(m) if x < 0.08), tT))\n    return np.array([mm, am, me, local_min, slope, first_low], dtype=np.float32)\n\n@torch.no_grad()\ndef greedy_rollout(model, tok, prompt, max_new_tokens=96):\n    ids = tok(prompt, return_tensors=\"pt\").input_ids.to(DEVICE)\n    margins, ents = [], []\n    logp = 0.0\n    for _ in range(max_new_tokens):\n        probs, margin, ent = next_stats(model, ids)\n        margins.append(margin); ents.append(ent)\n        nxt = probs.argmax(dim=-1, keepdim=True)\n        logp += float(torch.log(probs.gather(-1, nxt) + 1e-12).item())\n        ids = torch.cat([ids, nxt], dim=-1)\n        if nxt.item() == tok.eos_token_id:\n            break\n    text = tok.decode(ids[0], skip_special_tokens=True)\n    return text, ids, margins, ents, logp\n\n# ----------------- Risk model + conformal risk control -----------------\n\ndef fit_risk_model(model, tok, calib, parse_fn, T=24):\n    # y=1 means error\n    X, y = [], []\n    for q, gold in calib:\n        prompt = f\"Q: {q}\\nA:\"\n        txt, ids, margins, ents, logp = greedy_rollout(model, tok, prompt)\n        pred = parse_fn(txt)\n        X.append(features_from_trace(margins, ents, T=T))\n        y.append(int(pred != gold))\n    X = np.stack(X)\n    y = np.array(y)\n    if LogisticRegression is None:\n        return None\n    clf = LogisticRegression(max_iter=300)\n    clf.fit(X, y)\n    return clf\n\n\ndef risk_score(risk_model, feat):\n    if risk_model is None:\n        # fallback: monotone proxy from min margin\n        mm = float(feat[0])\n        return float(1.0 / (1.0 + math.exp(30.0 * (mm - 0.08))))\n    return float(risk_model.predict_proba(feat.reshape(1, -1))[0, 1])\n\n\ndef conformal_threshold(risks, errors, alpha=0.2):\n    \"\"\"Choose the largest threshold t such that empirical error among {risk<=t} <= alpha.\n    This is a simple, feasible instantiation of risk-controlled selective prediction.\n    \"\"\"\n    pairs = sorted(zip(risks, errors), key=lambda x: x[0])\n    best_t = 0.0\n    err = 0\n    for i, (r, e) in enumerate(pairs, start=1):\n        err += int(e)\n        if err / i <= alpha:\n            best_t = r\n    return float(best_t)\n\n# ----------------- CR²AD decoding (rollback + budget) -----------------\n@torch.no_grad()\ndef cr2ad_decode(model, tok, prompt, parse_fn,\n                risk_model=None, t_alpha=0.5,\n                B=10, k=6, b=3, J=2,\n                rollback_w=8, lookahead=8,\n                max_new_tokens=96, T=24):\n    base_ids = tok(prompt, return_tensors=\"pt\").input_ids.to(DEVICE)\n    base_len = base_ids.shape[1]\n\n    # hyp: (ids, margins, ents, logp, j, ended)\n    hyps = [(base_ids, [], [], 0.0, 0, False)]\n    expanded = 1\n\n    for _ in range(max_new_tokens):\n        new_hyps = []\n        all_ended = True\n        for ids, margins, ents, lp, j, ended in hyps:\n            if ended:\n                new_hyps.append((ids, margins, ents, lp, j, True))\n                continue\n            all_ended = False\n\n            # compute risk on current trace\n            feat = features_from_trace(margins, ents, T=T)\n            r = risk_score(risk_model, feat)\n\n            can_rethink = (r > t_alpha) and (j < J) and (expanded < B) and (len(margins) > 0)\n            if can_rethink:\n                # pick rollback token index g within last rollback_w generated tokens\n                w = min(rollback_w, len(margins))\n                local = np.argmin(np.array(margins[-w:], dtype=np.float32))\n                g = (len(margins) - w) + int(local)  # 0-based generated-token index\n                trunc_len = base_len + g\n                pref = ids[:, :trunc_len]\n\n                # branch at position g (i.e., choose alternative token at that step)\n                probs, margin_now, ent_now = next_stats(model, pref)\n                topk = torch.topk(probs, k=min(k, probs.shape[-1]), dim=-1)\n\n                cands = []\n                for i in range(topk.indices.shape[1]):\n                    nxt = topk.indices[:, i:i+1]\n                    pref2 = torch.cat([pref, nxt], dim=-1)\n                    lp2 = lp\n                    lp2 += float(torch.log(probs.gather(-1, nxt) + 1e-12).item())\n                    m2 = margins[:g] + [margin_now]\n                    e2 = ents[:g] + [ent_now]\n\n                    tmp_ids = pref2\n                    tmp_m, tmp_e = list(m2), list(e2)\n                    tmp_lp = lp2\n                    # short greedy lookahead\n                    for _ in range(lookahead):\n                        pr, m3, e3 = next_stats(model, tmp_ids)\n                        tmp_m.append(m3); tmp_e.append(e3)\n                        nxt2 = pr.argmax(dim=-1, keepdim=True)\n                        tmp_lp += float(torch.log(pr.gather(-1, nxt2) + 1e-12).item())\n                        tmp_ids = torch.cat([tmp_ids, nxt2], dim=-1)\n                        if nxt2.item() == tok.eos_token_id:\n                            break\n                    feat2 = features_from_trace(tmp_m, tmp_e, T=T)\n                    r2 = risk_score(risk_model, feat2)\n                    # objective: maximize risk reduction + likelihood stability\n                    score = (r - r2) + 0.05 * (tmp_lp / max(1, tmp_ids.shape[1] - base_len))\n                    cands.append((score, pref2, m2, e2, lp2))\n\n                cands.sort(key=lambda x: x[0], reverse=True)\n                keep = cands[:min(b, len(cands))]\n                for score, pref2, m2, e2, lp2 in keep:\n                    new_hyps.append((pref2, m2, e2, lp2, j+1, False))\n                expanded = min(B, expanded + min(k, len(cands)))\n                continue\n\n            # otherwise one greedy step\n            probs, margin, ent = next_stats(model, ids)\n            nxt = probs.argmax(dim=-1, keepdim=True)\n            lp2 = lp + float(torch.log(probs.gather(-1, nxt) + 1e-12).item())\n            ids2 = torch.cat([ids, nxt], dim=-1)\n            ended2 = (nxt.item() == tok.eos_token_id)\n            new_hyps.append((ids2, margins + [margin], ents + [ent], lp2, j, ended2))\n\n        hyps = new_hyps\n        if all_ended:\n            break\n\n    # aggregate answers by answer string\n    score_by_ans = {}\n    texts = []\n    for ids, margins, ents, lp, j, ended in hyps:\n        txt = tok.decode(ids[0], skip_special_tokens=True)\n        texts.append(txt)\n        ans = parse_fn(txt)\n        if ans is None:\n            continue\n        feat = features_from_trace(margins, ents, T=T)\n        r = risk_score(risk_model, feat)\n        w = (1.0 - r) * math.exp(0.02 * lp)\n        score_by_ans[ans] = score_by_ans.get(ans, 0.0) + w\n\n    best = max(score_by_ans.items(), key=lambda kv: kv[1])[0] if score_by_ans else None\n    return best, texts, expanded\n\n# ----------------- Minimal runnable experiment -----------------\nif __name__ == \"__main__\":\n    model_name = \"EleutherAI/pythia-410m\"\n    tok = AutoTokenizer.from_pretrained(model_name)\n    if tok.pad_token_id is None:\n        tok.pad_token = tok.eos_token\n    model = AutoModelForCausalLM.from_pretrained(model_name).to(DEVICE)\n    model.eval()\n\n    # Mixed-task evaluation improves significance beyond last-integer tasks\n    calib_ar = make_data(\"arith\", n=300, seed=1)\n    test_ar  = make_data(\"arith\", n=300, seed=2)\n    calib_cf = make_data(\"coin\",  n=300, seed=3)\n    test_cf  = make_data(\"coin\",  n=300, seed=4)\n\n    # Fit separate risk models + thresholds per task (still dataset-light)\n    rm_ar = fit_risk_model(model, tok, calib_ar, last_int)\n    rm_cf = fit_risk_model(model, tok, calib_cf, last_ab)\n\n    def get_risks_errors(calib, parse_fn, rm):\n        risks, errs = [], []\n        for q, gold in calib:\n            prompt = f\"Q: {q}\\nA:\"\n            txt, ids, m, e, lp = greedy_rollout(model, tok, prompt)\n            feat = features_from_trace(m, e)\n            r = risk_score(rm, feat)\n            pred = parse_fn(txt)\n            risks.append(r)\n            errs.append(int(pred != gold))\n        return risks, errs\n\n    alpha = 0.2\n    r_ar, e_ar = get_risks_errors(calib_ar, last_int, rm_ar)\n    r_cf, e_cf = get_risks_errors(calib_cf, last_ab,  rm_cf)\n    t_ar = conformal_threshold(r_ar, e_ar, alpha=alpha)\n    t_cf = conformal_threshold(r_cf, e_cf, alpha=alpha)\n\n    def eval_task(data, parse_fn, rm, t):\n        ok_g = 0; ok_c = 0\n        exp_c = []\n        for q, gold in data:\n            prompt = f\"Q: {q}\\nA:\"\n            # greedy\n            txt, *_ = greedy_rollout(model, tok, prompt)\n            ok_g += int(parse_fn(txt) == gold)\n            # CR²AD\n            pred, texts, exp = cr2ad_decode(model, tok, prompt, parse_fn, risk_model=rm, t_alpha=t,\n                                            B=10, k=6, b=3, J=2, rollback_w=8)\n            ok_c += int(pred == gold)\n            exp_c.append(exp)\n        return ok_g/len(data), ok_c/len(data), float(np.mean(exp_c))\n\n    g1, c1, ex1 = eval_task(test_ar, last_int, rm_ar, t_ar)\n    g2, c2, ex2 = eval_task(test_cf, last_ab,  rm_cf, t_cf)\n    print({\"alpha\": alpha,\n           \"arith_greedy_acc\": g1, \"arith_cr2ad_acc\": c1, \"arith_avg_exp\": ex1,\n           \"coin_greedy_acc\": g2, \"coin_cr2ad_acc\": c2, \"coin_avg_exp\": ex2})\n",
     "expected_result": "With `pythia-410m` (or similar) and B=10 on 300-test-per-task synthetic sets:\n\n- **Arithmetic**\n  - Greedy accuracy: ~0.40–0.50\n  - CoT-decoding (first-token, k=10): ~0.47–0.55 (avg expansions=10)\n  - UT-CoT (single trigger, tuned τ): ~0.50–0.57 (avg expansions ~4–7)\n  - RAHD (multi-cycle forward branching, calibrated ρ): ~0.54–0.60 (avg expansions ~3–6)\n  - **CR²AD (ours; rollback + conformal α=0.2): ~0.58–0.64** (avg expansions ~3–6)\n\n- **Coin-Flip state tracking (A/B)**\n  - Greedy accuracy: ~0.55–0.70\n  - CoT-decoding (k=10): ~0.60–0.74\n  - RAHD: ~0.64–0.76\n  - **CR²AD: ~0.68–0.80** (best gains on longer flip sequences where late uncertainty spikes occur)\n\nReliability expectation:\n- The empirical error rate on instances where CR²AD performs **no rollback** should be close to and typically ≤ α on test (minor deviation due to distribution shift), demonstrating *predictable* confidence/compute behavior.\n\nHigher is better for accuracy; lower is better for avg expansions/latency.",
     "expected_conclusion": "CR²AD makes CoT-decoding more *human-like* and more *deployment-relevant* by introducing a metacognitive controller with an interpretable safety knob (α) and a backtracking mechanism: the model can (i) decide when it is unsafe to continue greedily, (ii) roll back to revise a previously shaky local decision, and (iii) do so under a strict compute budget.\n\nAcademically, the key novelty is reframing “hesitation” as **risk-controlled selective deliberation** (conformal/coverage-style control) and combining it with **rollback edits**—a capability gap in first-token branching, UT-CoT’s single hesitation, and forward-only multi-cycle branching. Practically/socially, this yields **predictable compute–reliability tradeoffs** and reduces confident-but-wrong outputs without finetuning or external verifiers, supporting safer use in education/tutoring and other budget-constrained settings."
+  },
+  "experimental_design": {
+    "experiment_summary": "Task: Given a math word problem, the model must generate a final numeric answer. We compare standard greedy decoding vs. the proposed decoding-time controller CR²AD, which (1) calibrates a lightweight error-risk predictor from logit-derived uncertainty features on a small labeled calibration split (no LM fine-tuning), (2) converts “when to reconsider” into a conformal selective-prediction rule to choose a risk threshold t_α that controls the error rate among outputs accepted without rollback, and (3) during generation, triggers a budgeted multi-cycle notice→rollback→edit loop that can backtrack to an earlier uncertain token and locally rewrite the continuation under a strict hypothesis/compute budget.\n\nWorkflow:\n1) Build calibration split from GSM8K: run greedy decoding; compute token-level uncertainty traces (margins/entropy); fit risk model r̂(x)≈P(error|features). 2) Use conformal risk control on calibration to compute t_α for a user-specified α (e.g., 0.2). 3) On test, decode each problem with CR²AD under fixed compute budget B (max maintained/expanded hypotheses) and max_new_tokens; when r̂>t_α and budget remains, pick rollback point within last w generated tokens at maximal uncertainty, branch top-k tokens at that position, do short lookahead to estimate post-edit risk reduction, keep best b branches, and continue. 4) Aggregate hypotheses by extracted numeric answer and choose the highest weighted answer using (1−r̂) and sequence likelihood.\n\nScale fitted to Runner (single A100/H200, ample RAM): inference-only for the LM, small calibration (N_cal=500) and moderate test (N_test=1000) to keep runtime practical even with branching. Use max_new_tokens=128 and hypothesis budget B=8–12; processing is sequential (batch=1) to simplify variable-length branching. Expected total compute stays within a few GPU-hours for 0.6B model.",
+    "runner_config": {
+      "runner_label": [
+        "self-hosted",
+        "gpu-runner"
+      ],
+      "description": "NVIDIA A100 or H200, VRAM: 80 GB or more, RAM: 2048 GB or more"
+    },
+    "evaluation_metrics": [
+      {
+        "name": "accuracy",
+        "description": "Correctness criteria: A prediction is correct if the extracted final integer from the model output equals the GSM8K ground-truth answer after normalization. Normalization: (i) extract the last signed integer in the output using regex `-?\\d+`; (ii) if no integer is present, mark incorrect; (iii) compare as exact integer equality.\n\nCalculation method: accuracy = (1/N) * Σ_i 1[ŷ_i = y_i] over the evaluated set.\n\nTask appropriateness: GSM8K is an exact-answer math dataset; accuracy directly measures whether decoding produces the correct final result.\n\nRelevant visualizations: (1) Bar chart of accuracy by method; (2) Accuracy vs. compute-budget curve (vary B) to show compute–performance tradeoff."
+      },
+      {
+        "name": "mean_forward_passes",
+        "description": "Correctness criteria: Count all model forward passes executed during decoding for one instance, including greedy steps, rollback expansions, and lookahead rollouts.\n\nCalculation method: For each example i, record fp_i. Report mean_forward_passes = (1/N) * Σ_i fp_i.\n\nTask appropriateness: Branching/rollback methods trade accuracy for inference compute; forward-pass count is a hardware-agnostic latency proxy.\n\nRelevant visualizations: (1) Box/violin plot of per-example forward passes; (2) Scatter plot of forward passes vs. correctness (correct/incorrect) to inspect whether extra compute is spent on harder cases."
+      },
+      {
+        "name": "avg_expanded_hypotheses",
+        "description": "Correctness criteria: Track how many distinct hypotheses are instantiated during decoding (including pruned candidates), capped by the configured budget B.\n\nCalculation method: For each example i, record h_i (total hypotheses created). Report avg_expanded_hypotheses = (1/N) * Σ_i h_i.\n\nTask appropriateness: Directly measures how aggressively the controller branches; needed to confirm compute matching to baselines.\n\nRelevant visualizations: Histogram of h_i; line plot of accuracy vs. avg_expanded_hypotheses when sweeping B/k/b."
+      },
+      {
+        "name": "selective_error_rate_no_rollback",
+        "description": "Correctness criteria: Consider the subset S of test instances for which CR²AD performs zero rollback events (J_used=0). For those, correctness is defined as in accuracy.\n\nCalculation method: selective_error_rate_no_rollback = (Σ_{i∈S} 1[ŷ_i ≠ y_i]) / max(1, |S|). Also report coverage_no_rollback = |S|/N.\n\nTask appropriateness: This is the key reliability claim: conformal risk control targets an upper bound α on the error rate of outputs the system chooses not to reconsider.\n\nRelevant visualizations: (1) Risk–coverage curve: plot coverage_no_rollback vs. selective_error_rate_no_rollback for multiple α; (2) Calibration plot comparing predicted risk r̂ bins to empirical error in S."
+      },
+      {
+        "name": "answer_error_distribution",
+        "description": "Correctness criteria: For numeric outputs, define error as e_i = ŷ_i − y_i (integer difference) when an answer is extractable; if not extractable, treat as NaN and report extractable rate separately.\n\nCalculation method: Report median(|e|), mean(|e|) over extractable predictions, and extractable_rate = (# extractable)/N.\n\nTask appropriateness: Beyond exact correctness, numeric error magnitude diagnoses whether failures are near-misses or severe.\n\nRelevant visualizations: (1) Histogram of e_i; (2) CDF of |e_i| for each method."
+      }
+    ],
+    "models_to_use": [
+      "Qwen3-0.6B (0.6B parameters)"
+    ],
+    "datasets_to_use": [
+      "gsm8k"
+    ],
+    "proposed_method": {
+      "method_name": "CR²AD (Conformal Risk-Controlled Rollback Anytime Decoding)",
+      "description": "Inference-time metacognitive decoding controller that (i) learns a lightweight risk predictor from logit-derived uncertainty features on a small calibration split (no LM fine-tuning), (ii) computes a conformal/selective threshold t_α to control error rate among outputs accepted without rollback, and (iii) performs budgeted multi-cycle rollback/backtracking edits to revise earlier uncertain token decisions when predicted risk spikes, selecting branches by estimated risk reduction under a strict hypothesis budget.",
+      "optuna_config": {
+        "enabled": true,
+        "n_trials": 20,
+        "search_spaces": [
+          {
+            "param_name": "alpha",
+            "distribution_type": "categorical",
+            "choices": [
+              0.1,
+              0.15,
+              0.2,
+              0.25
+            ]
+          },
+          {
+            "param_name": "B",
+            "distribution_type": "categorical",
+            "choices": [
+              6,
+              8,
+              10,
+              12
+            ]
+          },
+          {
+            "param_name": "rollback_w",
+            "distribution_type": "categorical",
+            "choices": [
+              4,
+              8,
+              12
+            ]
+          },
+          {
+            "param_name": "k",
+            "distribution_type": "categorical",
+            "choices": [
+              4,
+              6,
+              8
+            ]
+          },
+          {
+            "param_name": "b",
+            "distribution_type": "categorical",
+            "choices": [
+              2,
+              3,
+              4
+            ]
+          },
+          {
+            "param_name": "lookahead",
+            "distribution_type": "categorical",
+            "choices": [
+              4,
+              8,
+              12
+            ]
+          },
+          {
+            "param_name": "J",
+            "distribution_type": "categorical",
+            "choices": [
+              1,
+              2,
+              3
+            ]
+          },
+          {
+            "param_name": "lambda_logp",
+            "distribution_type": "uniform",
+            "low": 0.0,
+            "high": 0.05
+          }
+        ]
+      }
+    },
+    "comparative_methods": [
+      {
+        "method_name": "Greedy Decoding",
+        "description": "Standard left-to-right decoding that always selects the argmax token at each step without branching, rollback, or uncertainty-based control; serves as the compute-minimal baseline.",
+        "optuna_config": {
+          "enabled": false,
+          "n_trials": 20
+        }
+      }
+    ]
   }
 }
