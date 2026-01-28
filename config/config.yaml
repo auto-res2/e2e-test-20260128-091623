@@ -1,6 +1,6 @@
 defaults:
+  - runs: proposed-qwen3-0.6b-gsm8k
   - _self_
-  - runs: ${run}
 
 run: proposed-qwen3-0.6b-gsm8k
 mode: full

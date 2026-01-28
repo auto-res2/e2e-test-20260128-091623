@@ -12,7 +12,7 @@ def _has_path(cfg: DictConfig, path: str) -> bool:
 @hydra.main(config_path="../config", config_name="config", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     run_id = cfg.run
-    overrides = [f"run={run_id}", f"results_dir={cfg.results_dir}", f"mode={cfg.mode}"]
+    overrides = [f"runs={run_id}", f"run={run_id}", f"results_dir={cfg.results_dir}", f"mode={cfg.mode}"]
 
     if cfg.mode == "trial":
         overrides.append("wandb.mode=disabled")
